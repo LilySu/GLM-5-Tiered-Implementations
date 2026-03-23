@@ -71,18 +71,20 @@ def h100_test_tma_bandwidth_deepgemm():
         return True
 
     import deep_gemm
-    from deep_gemm.utils import per_token_cast_to_fp8
+    from deep_gemm.utils import per_token_cast_to_fp8, per_channel_cast_to_fp8
 
     device = "cuda"
     E, N, D, I = 8, 2048, 512, 128
 
     a = torch.randn(N, D, device=device, dtype=torch.bfloat16)
     b = torch.randn(E, I, D, device=device, dtype=torch.bfloat16)
-    # per_token_cast_to_fp8 returns 2D scale factors [rows, K//128] — required by grouped GEMM
+    # A (activations): per_token gives sf[N, D//128] — scales along K dimension per row
     a_fp8 = per_token_cast_to_fp8(a, False)
+    # B (weights): per_channel gives sf[I//128, D] — scales along N dimension per column
+    # For grouped: quantize each expert's [I, D] weight, then stack
     b_fp8_list, b_sf_list = [], []
     for e in range(E):
-        be = per_token_cast_to_fp8(b[e], False)
+        be = per_channel_cast_to_fp8(b[e], False)  # b[e] is [I, D], sf is [I//128, D]
         b_fp8_list.append(be[0])
         b_sf_list.append(be[1])
     b_fp8 = (torch.stack(b_fp8_list), torch.stack(b_sf_list))
