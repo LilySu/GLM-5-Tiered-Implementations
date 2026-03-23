@@ -15,6 +15,7 @@ Usage:
 """
 
 import sys
+import os
 import importlib
 import traceback
 
@@ -84,12 +85,7 @@ H100_TEST_MODULES = [
         "h100_test_deepgemm_grouped_gemm_contiguous",
         "h100_test_deepgemm_grouped_gemm_masked",
     ]),
-    # Cat 1: CUDA Graph Capture & Replay
-    ("h100_test_cuda_graph", [
-        "h100_test_cuda_graph_capture_model",
-        "h100_test_cuda_graph_sparse_index_update",
-        "h100_test_cuda_graph_speedup",
-    ]),
+    # ── Non-graph tests first (these must not be poisoned by graph failures) ──
     # Cat 2: TMA Verification
     ("h100_test_tma", [
         "h100_test_tma_bandwidth_flashmla",
@@ -107,12 +103,6 @@ H100_TEST_MODULES = [
         "h100_test_fp8_zero_handling",
         "h100_test_fp8_subnormal_precision",
         "h100_test_fp8_flashmla_kv_scale_correctness",
-    ]),
-    # Cat 6: Kernel Launch Overhead
-    ("h100_test_launch_overhead", [
-        "h100_test_launch_overhead_empty_kernels",
-        "h100_test_launch_overhead_per_layer",
-        "h100_test_launch_overhead_graph_vs_eager_model",
     ]),
     # Cat 7: Deterministic Execution
     ("h100_test_determinism", [
@@ -137,27 +127,70 @@ H100_TEST_MODULES = [
         "h100_test_thermal_sustained_gemm",
         "h100_test_thermal_clock_frequency",
     ]),
+    # ── CUDA Graph tests LAST (can poison CUDA context on failure) ──
+    # Cat 6: Kernel Launch Overhead (includes graph tests)
+    ("h100_test_launch_overhead", [
+        "h100_test_launch_overhead_empty_kernels",
+        "h100_test_launch_overhead_per_layer",
+        "h100_test_launch_overhead_graph_vs_eager_model",
+    ]),
+    # Cat 1: CUDA Graph Capture & Replay
+    ("h100_test_cuda_graph", [
+        "h100_test_cuda_graph_capture_model",
+        "h100_test_cuda_graph_sparse_index_update",
+        "h100_test_cuda_graph_speedup",
+    ]),
 ]
 
 # Cat 5: Multi-GPU (requires torchrun, run separately)
 # torchrun --nproc_per_node=2 -m glm5-kernels-flashmla-deepgemm.tests.h100_test_multi_gpu
 
 
-def _try_reset_cuda():
-    """Attempt to reset CUDA state between tests to prevent cascade failures.
+def _run_test_in_subprocess(module_name, fn_name, package):
+    """Run a single test in an isolated subprocess to prevent CUDA context poisoning.
 
-    Failed CUDA graph captures leave the context broken. This cleans up
-    between tests so one failure doesn't cascade into all subsequent tests.
+    Failed CUDA graph captures corrupt the entire process's CUDA context.
+    gc.collect()/empty_cache()/synchronize() CANNOT fix this in PyTorch 2.8.0+.
+    The ONLY reliable fix is process isolation.
     """
+    import subprocess
+    cmd = [
+        sys.executable, "-c",
+        f"import sys; sys.path.insert(0, '.'); "
+        f"from importlib import import_module; "
+        f"mod = import_module('.{module_name}', package='{package}'); "
+        f"fn = getattr(mod, '{fn_name}'); "
+        f"result = fn(); "
+        f"sys.exit(0 if result else 1)"
+    ]
     try:
-        import gc
-        import torch
-        if torch.cuda.is_available():
-            gc.collect()
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-    except Exception:
-        pass
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=300,
+            cwd=os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")),
+        )
+        # Print the subprocess output
+        if proc.stdout:
+            for line in proc.stdout.strip().split('\n'):
+                print(line)
+        if proc.stderr:
+            # Only print stderr if it contains real errors, not warnings
+            for line in proc.stderr.strip().split('\n'):
+                if 'Error' in line or 'FAIL' in line or 'Traceback' in line:
+                    print(line)
+        return proc.returncode == 0
+    except subprocess.TimeoutExpired:
+        print(f"  ERROR {module_name}.{fn_name}: timed out after 300s")
+        return False
+    except Exception as e:
+        print(f"  ERROR {module_name}.{fn_name}: subprocess failed: {e}")
+        return False
+
+
+# Tests that use CUDA graphs and can poison the CUDA context if they fail
+GRAPH_TESTS = {
+    "h100_test_cuda_graph",
+    "h100_test_launch_overhead",
+}
 
 
 def run_test_list(test_modules, label):
@@ -168,15 +201,21 @@ def run_test_list(test_modules, label):
     errors = 0
 
     for module_name, test_fns in test_modules:
-        mod = importlib.import_module(f".{module_name}", package="glm5-kernels-flashmla-deepgemm.tests")
+        use_subprocess = module_name in GRAPH_TESTS
+        if not use_subprocess:
+            mod = importlib.import_module(f".{module_name}", package="glm5-kernels-flashmla-deepgemm.tests")
+
         for fn_name in test_fns:
             total += 1
             full_name = f"{module_name}.{fn_name}"
-            # Reset CUDA state before each H100 test to prevent cascade failures
-            _try_reset_cuda()
             try:
-                fn = getattr(mod, fn_name)
-                result = fn()
+                if use_subprocess:
+                    # Run in subprocess to isolate CUDA graph failures
+                    result = _run_test_in_subprocess(
+                        module_name, fn_name, "glm5-kernels-flashmla-deepgemm.tests")
+                else:
+                    fn = getattr(mod, fn_name)
+                    result = fn()
                 all_results[full_name] = result
                 if result:
                     passed += 1
