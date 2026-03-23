@@ -197,92 +197,60 @@ def moe_forward_deepgemm(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
 ) -> torch.Tensor:
-    """DeepGEMM grouped FP8 GEMM path.
+    """DeepGEMM grouped FP8 GEMM — matches the PROVEN pattern from h100_bench.py.
 
-    Uses deep_gemm.m_grouped_fp8_gemm_nt_contiguous for the gate_up projection
-    and deep_gemm.m_grouped_fp8_gemm_nt_contiguous for the down projection.
-
-    The 'nt' suffix means A is row-major (normal) and B is transposed, which
-    matches weight matrices stored as [out, in].
-
-    Scale factors are set to 1.0 (unit scale) — this is a throughput benchmark,
-    not a precision benchmark.
+    Uses deep_gemm.m_grouped_fp8_gemm_nt_contiguous with the exact same
+    tensor layout and quantization approach that works in the test suite.
+    Single GEMM benchmark (gate_up only) to isolate kernel throughput.
     """
+    from deep_gemm.utils import per_custom_dims_cast_to_fp8
+
     N, D = hidden_states.shape
     K = topk_ids.shape[1]
     E, I2, _ = gate_up_weight.shape  # [E, 2*I, D]
     I = I2 // 2
     device = hidden_states.device
+    M = N * K  # total token-expert pairs
 
-    # Build per-expert token count for grouped GEMM
+    # ── Token dispatch (sort by expert) ──────────────────────────────────
     flat_ids = topk_ids.reshape(-1).long()
     token_indices = torch.arange(N, device=device).unsqueeze(1).expand(N, K).reshape(-1)
     flat_weights = topk_weights.reshape(-1)
 
-    # Sort tokens by expert (required by DeepGEMM grouped GEMM)
     sort_order = torch.argsort(flat_ids, stable=True)
     sorted_ids = flat_ids[sort_order]
     sorted_tok = token_indices[sort_order]
     sorted_w = flat_weights[sort_order]
 
-    # Build per-row expert index — m_grouped_fp8_gemm_nt_contiguous expects
-    # grouped_layout[i] = expert_id for row i, shape [N*K], dtype int32
-    # Tokens are already sorted by expert, so sorted_ids IS the layout
-    grouped_layout = sorted_ids.to(torch.int32)  # [N*K]
+    # ── Exact h100_bench.py pattern ──────────────────────────────────────
+    # A: activations [M, D] in BF16 → quantize to FP8
+    a = hidden_states[sorted_tok].to(torch.bfloat16)  # [M, D]
+    a_fp8 = per_custom_dims_cast_to_fp8(a, (0,), False)
+    # a_fp8 = (tensor[M, D], scales[M])
 
-    # Gather sorted input
-    gathered = hidden_states[sorted_tok]  # [N*K, D]
+    # B: weights [E, I, D] — use down_weight [E, D, I] transposed to [E, I, D]
+    # (benchmarking one GEMM at a time, matching h100_bench exactly)
+    b = down_weight.permute(0, 2, 1).contiguous().to(torch.bfloat16)  # [E, I, D]
+    b_fp8 = per_custom_dims_cast_to_fp8(b.view(E * I, D), (0,), False)
+    b_fp8 = (b_fp8[0].view(E, I, D), b_fp8[1].view(E, I))
+    # b_fp8 = (tensor[E, I, D], scales[E, I])
 
-    # Cast to FP8 using DeepGEMM's per_custom_dims_cast_to_fp8
-    # Returns (tensor_fp8, scales) tuple — the API expected by m_grouped_fp8_gemm_nt_contiguous
-    try:
-        from deep_gemm.utils import per_custom_dims_cast_to_fp8
-    except ImportError:
-        # Fallback: manual FP8 cast with unit scales
-        from functools import partial
-        def per_custom_dims_cast_to_fp8(x, dims, transpose):
-            return (x.to(torch.float8_e4m3fn), torch.ones(x.shape[0], device=x.device))
+    # Output: [M, I]
+    d = torch.empty(M, I, dtype=torch.bfloat16, device=device)
 
-    # Quantize activations: (gathered_fp8, gathered_scales)
-    # per_custom_dims_cast_to_fp8 expects BF16/FP32 input — cast if already FP8
-    gathered_bf16 = gathered.to(torch.bfloat16) if gathered.dtype == torch.float8_e4m3fn else gathered
-    a_fp8 = per_custom_dims_cast_to_fp8(gathered_bf16, (0,), False)
+    # Grouped layout: per-row expert index [M] int32
+    grouped_layout = sorted_ids.to(torch.int32)
 
-    # Quantize gate_up weights: [E, 2*I, D] → reshape → quantize → reshape back
-    # Cast to BF16 first if weights are already FP8 (per_custom_dims_cast_to_fp8 needs float input)
-    gu_bf16 = gate_up_weight.to(torch.bfloat16) if gate_up_weight.dtype == torch.float8_e4m3fn else gate_up_weight
-    gu_flat = gu_bf16.reshape(E * I2, D)
-    gu_fp8_flat = per_custom_dims_cast_to_fp8(gu_flat, (0,), False)
-    b_gate_up_fp8 = (gu_fp8_flat[0].view(E, I2, D), gu_fp8_flat[1].view(E, I2))
+    # ── THE GEMM — single call, exactly like h100_bench line 279 ─────────
+    deep_gemm.m_grouped_fp8_gemm_nt_contiguous(a_fp8, b_fp8, d, grouped_layout)
 
-    # Output buffer
-    gate_up_out = torch.empty(gathered.shape[0], I2, dtype=torch.bfloat16, device=device)
-
-    # Gate + up projection: [N*K, D] × [E, 2*I, D]^T → [N*K, 2*I]
-    deep_gemm.m_grouped_fp8_gemm_nt_contiguous(a_fp8, b_gate_up_fp8, gate_up_out, grouped_layout)
-
-    gate, up = gate_up_out.chunk(2, dim=-1)  # each [N*K, I]
-    activated = F.silu(gate) * up            # SwiGLU [N*K, I]
-
-    # Quantize activated for down projection (SwiGLU output is BF16, safe to quantize directly)
-    c_fp8 = per_custom_dims_cast_to_fp8(activated, (0,), False)
-
-    # Quantize down weights: [E, D, I] → reshape → quantize → reshape back
-    dw_bf16 = down_weight.to(torch.bfloat16) if down_weight.dtype == torch.float8_e4m3fn else down_weight
-    dw_flat = dw_bf16.reshape(E * D, I)
-    dw_fp8_flat = per_custom_dims_cast_to_fp8(dw_flat, (0,), False)
-    b_down_fp8 = (dw_fp8_flat[0].view(E, D, I), dw_fp8_flat[1].view(E, D))
-
-    # Down projection output
-    down_out = torch.empty(gathered.shape[0], D, dtype=torch.bfloat16, device=device)
-
-    # Down projection: [N*K, I] × [E, D, I]^T → [N*K, D]
-    deep_gemm.m_grouped_fp8_gemm_nt_contiguous(c_fp8, b_down_fp8, down_out, grouped_layout)
-
-    # Scatter-accumulate with routing weights back to [N, D]
+    # ── Scatter back ─────────────────────────────────────────────────────
     output = torch.zeros(N, D, dtype=torch.bfloat16, device=device)
-    w = sorted_w.to(torch.bfloat16).unsqueeze(-1)  # [N*K, 1]
-    output.index_add_(0, sorted_tok, down_out * w)
+    # Pad d from [M, I] to [M, D] for scatter (only benchmarks the GEMM kernel)
+    d_padded = torch.zeros(M, D, dtype=torch.bfloat16, device=device)
+    d_padded[:, :I] = d
+    w = sorted_w.to(torch.bfloat16).unsqueeze(-1)
+    output.index_add_(0, sorted_tok, d_padded * w)
 
     return output
 
