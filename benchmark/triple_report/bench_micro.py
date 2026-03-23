@@ -861,9 +861,9 @@ def main() -> None:
         sys.exit(1)
 
     # Override module-level constants if user passed different values
-    global WARMUP, ITERS
-    WARMUP = args.warmup
-    ITERS  = args.iters
+    import benchmark.triple_report.bench_micro as _self
+    _self.WARMUP = args.warmup
+    _self.ITERS  = args.iters
 
     device = torch.device(args.device)
     env    = capture_environment()
