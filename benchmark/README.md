@@ -228,13 +228,67 @@ This is the recommended benchmark path. FP8 grouped GEMM should only be used at 
 - The NVCC 12.9 warning (`Warning: please use at least NVCC 12.9 for the best DeepGEMM performance`) is non-fatal but indicates suboptimal kernel codegen with CUDA 12.8
 - DeepGEMM JIT compiles kernels on first call (~10-60s). Cache at `~/.deep_gemm/`
 
-### First Benchmark Result
+### Confirmed Working API Patterns (March 2026, H100 + PyTorch 2.8.0+cu128)
+
+**FlashMLA dense decode:**
+```python
+from flash_mla import flash_mla_with_kvcache, get_mla_metadata
+metadata, _ = get_mla_metadata(cache_seqlens, page_size_tensor)
+out, lse = flash_mla_with_kvcache(
+    q,            # [B, 1, H, 576] BF16 — absorbed Q
+    k_cache,      # [num_pages, 64, 1, 576] BF16 — paged KV
+    block_table,  # [B, pages_per_seq] int32
+    cache_seqlens,# [B] int32
+    head_dim_v=512,                     # REQUIRED — absorbed V dim
+    tile_scheduler_metadata=metadata,   # REQUIRED — from get_mla_metadata
+    causal=False,
+)
+# Output: [B, 1, H, 512]
+```
+
+**DeepGEMM fp8_mqa_logits (DSA indexer):**
+```python
+# q: raw FP8 tensor [seq_len, num_heads, head_dim] — NOT a tuple
+q_fp8 = q_bf16.to(torch.float8_e4m3fn)
+
+# kv: tuple of (FP8 tensor [seq_kv, head_dim], 1D scales [seq_kv])
+# Scales MUST be 1D — per_token_cast_to_fp8 gives 2D, use manual scaling
+kv_fp8 = kv_bf16.to(torch.float8_e4m3fn)
+kv_scales = kv_bf16.abs().amax(dim=-1).float() / 448.0  # 1D [seq_kv]
+
+logits = deep_gemm.fp8_mqa_logits(
+    q_fp8,                    # raw tensor, NOT tuple
+    (kv_fp8, kv_scales),      # tuple with 1D scales
+    weights,                  # [seq_len, num_heads] float32
+    cu_seq_len_k_start,       # [seq_len] int32
+    cu_seq_len_k_end,         # [seq_len] int32
+)
+```
+
+**DeepGEMM BF16 grouped GEMM (MoE):**
+```python
+# No quantization — direct BF16 tensors
+deep_gemm.m_grouped_bf16_gemm_nt_contiguous(
+    a,               # [M, D] BF16 — sorted activations
+    b,               # [E, I, D] BF16 — expert weights
+    output,          # [M, I] BF16 — pre-allocated output
+    grouped_layout,  # [M] int32 — per-row expert index (NOT cumulative)
+)
+```
+
+### Benchmark Results on H100 80GB HBM3
 
 ```
-GLM-5 MoE Grouped GEMM (BF16) on H100 80GB HBM3:
-  E=256 experts, I=2048 intermediate, D=6144 hidden, M=8192 tokens (256×32 avg)
-  Latency: 0.34 ms
-  Throughput: 605.0 TFLOPS
-  MFU: 61.2% of H100 BF16 peak (989 TFLOPS)
+FlashMLA dense decode:
+  q=[32,1,64,576] kv_cache=[2048,64,1,576] → out=[32,1,64,512]
+  CONFIRMED WORKING
+
+DeepGEMM fp8_mqa_logits:
+  q=[1,32,128] kv=([256,128], [256]) → logits
+  CONFIRMED WORKING (Approach D: raw FP8 q + 1D kv scales)
+
+DeepGEMM BF16 grouped GEMM:
+  E=256, I=2048, D=6144, M=8192
+  0.333 ms, 618.9 TFLOPS (62.6% MFU)
   Reference: FA3 achieves 75% MFU for attention kernels
 ```

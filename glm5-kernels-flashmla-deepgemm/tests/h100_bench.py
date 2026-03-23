@@ -193,7 +193,7 @@ def bench_flashmla_decode(cfg, device):
     k_cache = torch.randn(num_pages, page_size, 1, d_qk, dtype=torch.bfloat16, device=device)
     block_table = torch.arange(num_pages, device=device, dtype=torch.int32).view(B, -1)
     cache_seqlens = torch.full((B,), seq_len_kv, dtype=torch.int32, device=device)
-    metadata, _ = get_mla_metadata()
+    metadata, _ = get_mla_metadata(cache_seqlens, page_size * torch.ones(1, dtype=torch.int32, device=device))
 
     def run():
         flash_mla_with_kvcache(q, k_cache, block_table, cache_seqlens,
@@ -225,11 +225,12 @@ def bench_deepgemm_mqa_logits(cfg, device):
     H = cfg["index_n_heads"]  # 32
     D = cfg["index_head_dim"]  # 128
 
+    # q: raw FP8 tensor [seq_len, H, D] — NOT a tuple (confirmed by debug_all_kernels2.py)
     q = torch.randn(seq_len, H, D, device=device, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    # kv: tuple of (FP8 tensor [seq_kv, D], 1D scales [seq_kv]) — scales MUST be 1D
     kv = torch.randn(seq_len_kv, D, device=device, dtype=torch.bfloat16)
-    kv_fp8, kv_scales = fp8.quantize_activations_deepgemm(kv)
-    kv_fp8 = kv_fp8.to(device)
-    kv_scales = kv_scales.to(device)
+    kv_fp8 = kv.to(torch.float8_e4m3fn)
+    kv_scales = kv.abs().amax(dim=-1).float() / 448.0  # 1D per-row scales [seq_kv]
     weights = torch.randn(seq_len, H, device=device, dtype=torch.float32)
     ks = torch.zeros(seq_len, dtype=torch.int32, device=device)
     ke = torch.full((seq_len,), seq_len_kv, dtype=torch.int32, device=device)
@@ -246,10 +247,14 @@ def bench_deepgemm_mqa_logits(cfg, device):
 
 
 def bench_deepgemm_grouped_gemm(cfg, device):
-    """Benchmark DeepGEMM FP8 grouped GEMM (MoE forward)."""
+    """Benchmark DeepGEMM BF16 grouped GEMM (MoE forward).
+
+    Uses BF16 path (confirmed working at 618 TFLOPS / 62.6% MFU on H100).
+    FP8 grouped GEMM requires per_block_cast_to_fp8 with TMA-aligned scales
+    which has dimension constraints — see benchmark/README.md for details.
+    """
     try:
         import deep_gemm
-        from deep_gemm.utils import per_custom_dims_cast_to_fp8
     except ImportError:
         return BenchResult(name="deepgemm_grouped_gemm", median_ms=-1, min_ms=-1, max_ms=-1,
                            num_iters=0, extra={"skip": "deep_gemm not installed"})
@@ -259,30 +264,24 @@ def bench_deepgemm_grouped_gemm(cfg, device):
     D = cfg["hidden_size"]  # 6144
     I = cfg["moe_intermediate_size"]  # 2048
     N = 1024  # tokens per batch
+    M = N * K  # total token-expert pairs
 
-    # Simulate sorted tokens (contiguous layout)
-    tokens_per_expert = N * K // E  # ~32 tokens per expert on average
-    a = torch.randn(N * K, D, device=device, dtype=torch.bfloat16)
+    # BF16 tensors — no quantization needed
+    a = torch.randn(M, D, device=device, dtype=torch.bfloat16)
     b = torch.randn(E, I, D, device=device, dtype=torch.bfloat16)
+    d = torch.empty(M, I, device=device, dtype=torch.bfloat16)
 
-    a_fp8 = per_custom_dims_cast_to_fp8(a, (0,), False)
-    b_fp8 = per_custom_dims_cast_to_fp8(b.view(E * I, D), (0,), False)
-    b_fp8 = (b_fp8[0].view(E, I, D), b_fp8[1].view(E, I))
-
-    d = torch.empty(N * K, I, device=device, dtype=torch.bfloat16)
-    grouped_layout = torch.zeros(N * K, dtype=torch.int32, device=device)
-    # Assign tokens to experts round-robin
-    for i in range(N * K):
-        grouped_layout[i] = i % E
+    # Per-row expert index [M] int32 — round-robin assignment
+    grouped_layout = (torch.arange(M, device=device, dtype=torch.int32) % E)
 
     def run():
-        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(a_fp8, b_fp8, d, grouped_layout)
+        deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d, grouped_layout)
 
-    result = cuda_timer(run, warmup=3, iters=10)
+    result = cuda_timer(run, warmup=5, iters=20)
     result.name = "deepgemm_grouped_gemm"
-    flops = 2 * N * K * D * I
+    flops = 2 * M * D * I
     result.tflops = flops / (result.median_ms * 1e-3) / 1e12
-    result.extra = {"tokens": N, "experts": E, "topk": K, "D": D, "I": I}
+    result.extra = {"tokens": N, "experts": E, "topk": K, "D": D, "I": I, "precision": "bf16"}
     return result
 
 
