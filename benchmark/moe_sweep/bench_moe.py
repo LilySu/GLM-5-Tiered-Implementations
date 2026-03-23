@@ -199,8 +199,8 @@ def moe_forward_deepgemm(
 ) -> torch.Tensor:
     """DeepGEMM grouped FP8 GEMM path.
 
-    Uses deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt for the gate_up projection
-    and deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt for the down projection.
+    Uses deep_gemm.m_grouped_fp8_gemm_nt_contiguous for the gate_up projection
+    and deep_gemm.m_grouped_fp8_gemm_nt_contiguous for the down projection.
 
     The 'nt' suffix means A is row-major (normal) and B is transposed, which
     matches weight matrices stored as [out, in].
@@ -232,30 +232,46 @@ def moe_forward_deepgemm(
     # Gather sorted input
     gathered = hidden_states[sorted_tok]  # [N*K, D]
 
-    # Cast to FP8 if not already
-    if gathered.dtype != torch.float8_e4m3fn:
-        gathered_fp8 = gathered.to(torch.float8_e4m3fn)
-    else:
-        gathered_fp8 = gathered
+    # Cast to FP8 using DeepGEMM's per_custom_dims_cast_to_fp8
+    # Returns (tensor_fp8, scales) tuple — the API expected by m_grouped_fp8_gemm_nt_contiguous
+    try:
+        from deep_gemm.utils import per_custom_dims_cast_to_fp8
+    except ImportError:
+        # Fallback: manual FP8 cast with unit scales
+        from functools import partial
+        def per_custom_dims_cast_to_fp8(x, dims, transpose):
+            return (x.to(torch.float8_e4m3fn), torch.ones(x.shape[0], device=x.device))
 
-    # Unit scales (throughput benchmark)
-    scale_a = torch.ones(1, device=device)
-    scale_b = torch.ones(E, device=device)
+    # Quantize activations: (gathered_fp8, gathered_scales)
+    a_fp8 = per_custom_dims_cast_to_fp8(gathered, (0,), False)
+
+    # Quantize gate_up weights: [E, 2*I, D] → reshape → quantize → reshape back
+    gu_flat = gate_up_weight.reshape(E * I2, D)
+    gu_fp8_flat = per_custom_dims_cast_to_fp8(gu_flat, (0,), False)
+    b_gate_up_fp8 = (gu_fp8_flat[0].view(E, I2, D), gu_fp8_flat[1].view(E, I2))
+
+    # Output buffer
+    gate_up_out = torch.empty(gathered.shape[0], I2, dtype=torch.bfloat16, device=device)
 
     # Gate + up projection: [N*K, D] × [E, 2*I, D]^T → [N*K, 2*I]
-    gate_up_out = deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt(
-        gathered_fp8, gate_up_weight, scale_a, scale_b, expert_ends
-    )
+    deep_gemm.m_grouped_fp8_gemm_nt_contiguous(a_fp8, b_gate_up_fp8, gate_up_out, expert_ends)
 
     gate, up = gate_up_out.chunk(2, dim=-1)  # each [N*K, I]
     activated = F.silu(gate) * up            # SwiGLU [N*K, I]
 
-    activated_fp8 = activated.to(torch.float8_e4m3fn)
+    # Quantize activated for down projection
+    c_fp8 = per_custom_dims_cast_to_fp8(activated, (0,), False)
+
+    # Quantize down weights: [E, D, I] → reshape → quantize → reshape back
+    dw_flat = down_weight.reshape(E * D, I)
+    dw_fp8_flat = per_custom_dims_cast_to_fp8(dw_flat, (0,), False)
+    b_down_fp8 = (dw_fp8_flat[0].view(E, D, I), dw_fp8_flat[1].view(E, D))
+
+    # Down projection output
+    down_out = torch.empty(gathered.shape[0], D, dtype=torch.bfloat16, device=device)
 
     # Down projection: [N*K, I] × [E, D, I]^T → [N*K, D]
-    down_out = deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt(
-        activated_fp8, down_weight, scale_a, scale_b, expert_ends
-    )
+    deep_gemm.m_grouped_fp8_gemm_nt_contiguous(c_fp8, b_down_fp8, down_out, expert_ends)
 
     # Scatter-accumulate with routing weights back to [N, D]
     output = torch.zeros(N, D, dtype=torch.bfloat16, device=device)

@@ -71,22 +71,23 @@ def h100_test_tma_bandwidth_deepgemm():
         return True
 
     import deep_gemm
-    from deep_gemm.utils import per_token_cast_to_fp8
+    from deep_gemm.utils import per_token_cast_to_fp8, per_block_cast_to_fp8
 
     device = "cuda"
     E, N, D, I = 8, 2048, 512, 128
 
     a = torch.randn(N, D, device=device, dtype=torch.bfloat16)
     b = torch.randn(E, I, D, device=device, dtype=torch.bfloat16)
-    # Both A and B use per_token quantization → sf[rows, K//128]
-    # GEMM is A[M,K] @ B[N,K]^T, so B's sf is [N, K//128] (per-row of B, which is per-column of B^T)
+    # A (activations [M,K]): per_token → sf[M, K//128]
+    # B (weights [N,K]):     per_block → sf[N//128, K//128]
+    # The kernel checks sf.size(-2) == ceil_div(N, gran_mn) where gran_mn=128
     a_fp8 = per_token_cast_to_fp8(a, False)  # sf[N, D//128]
     b_fp8_list, b_sf_list = [], []
     for e in range(E):
-        be = per_token_cast_to_fp8(b[e], False)  # b[e] is [I, D], sf is [I, D//128]
+        be = per_block_cast_to_fp8(b[e], False)  # b[e] is [I, D], sf is [I//128, D//128]
         b_fp8_list.append(be[0])
         b_sf_list.append(be[1])
-    b_fp8 = (torch.stack(b_fp8_list), torch.stack(b_sf_list))  # ([E,I,D], [E,I,D//128])
+    b_fp8 = (torch.stack(b_fp8_list), torch.stack(b_sf_list))  # ([E,I,D], [E,I//128,D//128])
     d = torch.empty(N, I, device=device, dtype=torch.bfloat16)
     layout = torch.arange(N, device=device, dtype=torch.int32) % E
 
