@@ -71,20 +71,23 @@ def h100_test_tma_bandwidth_deepgemm():
         return True
 
     import deep_gemm
-    from deep_gemm.utils import per_custom_dims_cast_to_fp8
+    from deep_gemm.utils import per_token_cast_to_fp8
 
     device = "cuda"
     E, N, D, I = 8, 2048, 512, 128
 
     a = torch.randn(N, D, device=device, dtype=torch.bfloat16)
     b = torch.randn(E, I, D, device=device, dtype=torch.bfloat16)
-    a_fp8 = per_custom_dims_cast_to_fp8(a, (0,), False)
-    b_fp8 = per_custom_dims_cast_to_fp8(b.reshape(E * I, D), (0,), False)
-    b_fp8 = (b_fp8[0].view(E, I, D), b_fp8[1].view(E, I))
+    # per_token_cast_to_fp8 returns 2D scale factors [rows, K//128] — required by grouped GEMM
+    a_fp8 = per_token_cast_to_fp8(a, False)
+    b_fp8_list, b_sf_list = [], []
+    for e in range(E):
+        be = per_token_cast_to_fp8(b[e], False)
+        b_fp8_list.append(be[0])
+        b_sf_list.append(be[1])
+    b_fp8 = (torch.stack(b_fp8_list), torch.stack(b_sf_list))
     d = torch.empty(N, I, device=device, dtype=torch.bfloat16)
-    layout = torch.zeros(N, dtype=torch.int32, device=device)
-    for i in range(N):
-        layout[i] = i % E
+    layout = torch.arange(N, device=device, dtype=torch.int32) % E
 
     def run():
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(a_fp8, b_fp8, d, layout)
