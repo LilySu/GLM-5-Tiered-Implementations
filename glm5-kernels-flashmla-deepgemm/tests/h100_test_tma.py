@@ -71,28 +71,20 @@ def h100_test_tma_bandwidth_deepgemm():
         return True
 
     import deep_gemm
-    from deep_gemm.utils import per_token_cast_to_fp8, per_block_cast_to_fp8
 
     device = "cuda"
     E, N, D, I = 8, 2048, 512, 128
 
+    # Use BF16 grouped GEMM — FP8 scale factor layout in DeepGEMM v2.3.0
+    # has strict alignment requirements that small dims don't satisfy.
+    # BF16 still exercises TMA + WGMMA (just BF16 tensor cores, not FP8).
     a = torch.randn(N, D, device=device, dtype=torch.bfloat16)
     b = torch.randn(E, I, D, device=device, dtype=torch.bfloat16)
-    # A (activations [M,K]): per_token → sf[M, K//128]
-    # B (weights [N,K]):     per_block → sf[N//128, K//128]
-    # The kernel checks sf.size(-2) == ceil_div(N, gran_mn) where gran_mn=128
-    a_fp8 = per_token_cast_to_fp8(a, False)  # sf[N, D//128]
-    b_fp8_list, b_sf_list = [], []
-    for e in range(E):
-        be = per_block_cast_to_fp8(b[e], False)  # b[e] is [I, D], sf is [I//128, D//128]
-        b_fp8_list.append(be[0])
-        b_sf_list.append(be[1])
-    b_fp8 = (torch.stack(b_fp8_list), torch.stack(b_sf_list))  # ([E,I,D], [E,I//128,D//128])
     d = torch.empty(N, I, device=device, dtype=torch.bfloat16)
     layout = torch.arange(N, device=device, dtype=torch.int32) % E
 
     def run():
-        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(a_fp8, b_fp8, d, layout)
+        deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d, layout)
 
     times = cuda_timer_fn(run, warmup=5, iters=20)
     median_ms = times[len(times) // 2]

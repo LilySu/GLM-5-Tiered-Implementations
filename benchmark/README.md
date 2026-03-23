@@ -171,9 +171,70 @@ alignment = get_m_alignment_for_contiguous_layout()  # Returns 128
 # Total M (token count) should ideally be a multiple of 128 for best performance
 ```
 
+### Quantization Function Signatures (PyTorch 2.8.0+cu128, DeepGEMM March 2026)
+
+All functions require `use_ue8m0: bool` as the second argument:
+```python
+per_block_cast_to_fp8(x: Tensor, use_ue8m0: bool, gran_k: int = 128) -> Tuple[Tensor, Tensor]
+per_token_cast_to_fp8(x: Tensor, use_ue8m0: bool, gran_k: int = 128) -> Tuple[Tensor, Tensor]
+per_channel_cast_to_fp8(x: Tensor, use_ue8m0: bool, gran_k: int = 128) -> Tuple[Tensor, Tensor]
+per_custom_dims_cast_to_fp8(x: Tensor, dims: Tuple, use_ue8m0: bool) -> Tuple[Tensor, Tensor]
+```
+
+### Scale Shape Depends on Input Size
+
+`per_block_cast_to_fp8` computes `scales.shape = [ceil(M/gran_m), ceil(K/gran_k)]` where `gran_k=128` by default and `gran_m` depends on the function. **If the input tensor has K≤128, scales collapse to `[1, 1]`** — a single scale for the whole tensor. This means FP8 grouped GEMM requires **K > 128** (i.e., hidden_dim or intermediate_dim > 128) to produce meaningful block scales.
+
+For GLM-5 full dimensions (D=6144, I=2048), this is not an issue:
+```
+per_block_cast_to_fp8([8192, 6144], True) → scales=[64, 48]  (8192/128=64 blocks along M, 6144/128=48 along K)
+per_block_cast_to_fp8([8192, 2048], True) → scales=[64, 16]  (2048/128=16 blocks along K)
+```
+
+But for small test dimensions (K=128): `per_block_cast_to_fp8([32, 128], True) → scales=[1, 1]` which fails `sf.size(-2) == ceil_div(mn, gran_mn)`.
+
+### TMA-Aligned Scale Transform
+
+For UE8M0 format (power-of-2 exponent-only scales), use:
+```python
+from deep_gemm.utils import get_mn_major_tma_aligned_packed_ue8m0_tensor
+scales_tma = get_mn_major_tma_aligned_packed_ue8m0_tensor(scales)
+# Converts FP32 scales to packed int32 UE8M0 format with TMA alignment
+```
+
+### Confirmed Working: BF16 Grouped GEMM
+
+BF16 grouped GEMM works at full GLM-5 dimensions and achieves strong throughput:
+```
+m_grouped_bf16_gemm_nt_contiguous at E=256, I=2048, D=6144, M=8192:
+  0.34 ms, 605.0 TFLOPS (61.2% MFU vs H100 BF16 peak 989 TFLOPS)
+```
+
+This is the recommended benchmark path. FP8 grouped GEMM should only be used at full GLM-5 dimensions (D=6144) where block-wise scales have sufficient granularity.
+
+### Recommended Benchmark Strategy
+
+1. **BF16 grouped GEMM** (`m_grouped_bf16_gemm_nt_contiguous`): Primary benchmark. No quantization complexity. Works at all tensor sizes. 605 TFLOPS measured on H100.
+
+2. **FP8 grouped GEMM** (`m_grouped_fp8_gemm_nt_contiguous`): Use ONLY at full GLM-5 dims (D≥2048). Quantize with `per_block_cast_to_fp8(x, use_ue8m0=True)`. For B weights `[E, N, K]`, flatten to `[E*N, K]`, quantize, reshape scales to `[E, N, ceil(K/128)]`.
+
+3. **BF16 for small test configs**: The tiny test config (D=128, I=64) should ALWAYS use BF16 to avoid FP8 scale collapse.
+
 ### Version Notes
 
 - Tested on: DeepGEMM (latest as of March 2026), PyTorch 2.8.0+cu128, H100 80GB HBM3
 - The `per_custom_dims_cast_to_fp8` function was used in older DeepGEMM examples but produces 1D scales incompatible with current GEMM kernels
+- All quantization functions now require `use_ue8m0: bool` as a mandatory second argument (not optional)
 - The NVCC 12.9 warning (`Warning: please use at least NVCC 12.9 for the best DeepGEMM performance`) is non-fatal but indicates suboptimal kernel codegen with CUDA 12.8
 - DeepGEMM JIT compiles kernels on first call (~10-60s). Cache at `~/.deep_gemm/`
+
+### First Benchmark Result
+
+```
+GLM-5 MoE Grouped GEMM (BF16) on H100 80GB HBM3:
+  E=256 experts, I=2048 intermediate, D=6144 hidden, M=8192 tokens (256×32 avg)
+  Latency: 0.34 ms
+  Throughput: 605.0 TFLOPS
+  MFU: 61.2% of H100 BF16 peak (989 TFLOPS)
+  Reference: FA3 achieves 75% MFU for attention kernels
+```

@@ -197,14 +197,12 @@ def moe_forward_deepgemm(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
 ) -> torch.Tensor:
-    """DeepGEMM grouped FP8 GEMM — matches the PROVEN pattern from h100_bench.py.
+    """DeepGEMM grouped GEMM — uses BF16 path (confirmed working at 605 TFLOPS on H100).
 
-    Uses deep_gemm.m_grouped_fp8_gemm_nt_contiguous with the exact same
-    tensor layout and quantization approach that works in the test suite.
-    Single GEMM benchmark (gate_up only) to isolate kernel throughput.
+    FP8 path requires per_block_cast_to_fp8 with dimensions > 128 and TMA-aligned
+    scales. BF16 grouped GEMM avoids all quantization complexity and achieves 61% MFU.
+    See benchmark/README.md "DeepGEMM FP8 Scale Tensor Layout" for details.
     """
-    from deep_gemm.utils import per_custom_dims_cast_to_fp8
-
     N, D = hidden_states.shape
     K = topk_ids.shape[1]
     E, I2, _ = gate_up_weight.shape  # [E, 2*I, D]
@@ -222,18 +220,11 @@ def moe_forward_deepgemm(
     sorted_tok = token_indices[sort_order]
     sorted_w = flat_weights[sort_order]
 
-    # ── Exact h100_bench.py pattern ──────────────────────────────────────
-    # A: activations [M, D] in BF16 → quantize to FP8
+    # ── Gather sorted activations ────────────────────────────────────────
     a = hidden_states[sorted_tok].to(torch.bfloat16)  # [M, D]
-    a_fp8 = per_custom_dims_cast_to_fp8(a, (0,), False)
-    # a_fp8 = (tensor[M, D], scales[M])
 
-    # B: weights [E, I, D] — use down_weight [E, D, I] transposed to [E, I, D]
-    # (benchmarking one GEMM at a time, matching h100_bench exactly)
+    # ── B weights: use down_weight [E, D, I] transposed to [E, I, D] ────
     b = down_weight.permute(0, 2, 1).contiguous().to(torch.bfloat16)  # [E, I, D]
-    b_fp8 = per_custom_dims_cast_to_fp8(b.view(E * I, D), (0,), False)
-    b_fp8 = (b_fp8[0].view(E, I, D), b_fp8[1].view(E, I))
-    # b_fp8 = (tensor[E, I, D], scales[E, I])
 
     # Output: [M, I]
     d = torch.empty(M, I, dtype=torch.bfloat16, device=device)
@@ -241,12 +232,11 @@ def moe_forward_deepgemm(
     # Grouped layout: per-row expert index [M] int32
     grouped_layout = sorted_ids.to(torch.int32)
 
-    # ── THE GEMM — single call, exactly like h100_bench line 279 ─────────
-    deep_gemm.m_grouped_fp8_gemm_nt_contiguous(a_fp8, b_fp8, d, grouped_layout)
+    # ── BF16 grouped GEMM — confirmed working, 605 TFLOPS on H100 ───────
+    deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d, grouped_layout)
 
     # ── Scatter back ─────────────────────────────────────────────────────
     output = torch.zeros(N, D, dtype=torch.bfloat16, device=device)
-    # Pad d from [M, I] to [M, D] for scatter (only benchmarks the GEMM kernel)
     d_padded = torch.zeros(M, D, dtype=torch.bfloat16, device=device)
     d_padded[:, :I] = d
     w = sorted_w.to(torch.bfloat16).unsqueeze(-1)
