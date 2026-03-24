@@ -166,10 +166,8 @@ def bench_single_layer(layer_type, B, S, T, impl, cfg, warmup=10, iters=50):
         # Build inputs matching h100_bench.py pattern
         hidden = torch.randn(B, S, cfg["hidden_size"], dtype=torch.bfloat16, device=device)
 
-        # Build position embeddings (cos, sin) — what the model actually expects
-        rope_dim = cfg.get("qk_rope_head_dim", 64)
-        rope = RotaryEmbedding(rope_dim, cfg.get("max_position_embeddings", 202752),
-                               cfg.get("rope_theta", 10000.0)).to(device)
+        # Build position embeddings (cos, sin) — RotaryEmbedding takes the full config dict
+        rope = RotaryEmbedding(test_cfg).to(device)
         position_ids = torch.arange(T - S, T, device=device).unsqueeze(0).expand(B, -1)
         cos, sin = rope(hidden, position_ids)
 
