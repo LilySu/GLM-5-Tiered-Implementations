@@ -163,10 +163,16 @@ def run_component_benchmark(output_dir="results/triple"):
     print(f"Model imported. hidden_size={cfg['hidden_size']}, experts={cfg['n_routed_experts']}")
     print()
 
+    # NOTE: Decode configs (S=1, T>S) crash with random weights because the
+    # DSA indexer's topk selects out-of-bounds indices. Only prefill configs
+    # (S=T, causal mask keeps indices valid) work without real model weights.
+    # For decode numbers, see h100_bench --full-dims (2.721ms dense, 4.866ms sparse).
     configs = [
+        {"B": 1, "S": 64, "T": 64, "label": "prefill_B1_S64"},
         {"B": 1, "S": 128, "T": 128, "label": "prefill_B1_S128"},
-        {"B": 1, "S": 1, "T": 4096, "label": "decode_B1_T4K"},
-        {"B": 4, "S": 1, "T": 4096, "label": "decode_B4_T4K"},
+        {"B": 1, "S": 256, "T": 256, "label": "prefill_B1_S256"},
+        {"B": 1, "S": 512, "T": 512, "label": "prefill_B1_S512"},
+        {"B": 4, "S": 128, "T": 128, "label": "prefill_B4_S128"},
     ]
 
     for c in configs:
