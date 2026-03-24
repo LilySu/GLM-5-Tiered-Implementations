@@ -103,11 +103,15 @@ def _ensure_symlinks():
                 pass  # May fail on some filesystems
 
 
-def _import_decoder_layer(impl):
+def _import_decoder_layer(impl, force_eager=False):
     """Import DecoderLayer from the correct model directory.
 
     Uses symlinks to work around Python's inability to import from
     hyphenated directory names.
+
+    If force_eager=True, patches the module-level FLASH_MLA_AVAILABLE and
+    DEEP_GEMM_AVAILABLE flags BEFORE loading the model, so the model
+    never tries to use kernel paths (which crash with random weights).
     """
     _ensure_symlinks()
 
@@ -118,11 +122,22 @@ def _import_decoder_layer(impl):
     else:
         raise ValueError(f"Unknown impl: {impl}")
 
-    # Add project root so the underscore-named symlink is importable
     if PROJECT_ROOT not in sys.path:
         sys.path.insert(0, PROJECT_ROOT)
 
-    # Import the model module from the symlinked package
+    if force_eager:
+        # Patch the availability flags BEFORE the model reads them
+        try:
+            attn_mod = __import__(f"{pkg}.mla_attention", fromlist=["FLASH_MLA_AVAILABLE"])
+            attn_mod.FLASH_MLA_AVAILABLE = False
+        except Exception:
+            pass
+        try:
+            idx_mod = __import__(f"{pkg}.dsa_indexer", fromlist=["DEEP_GEMM_AVAILABLE"])
+            idx_mod.DEEP_GEMM_AVAILABLE = False
+        except Exception:
+            pass
+
     mod = __import__(f"{pkg}.model", fromlist=["DecoderLayer"])
     return mod.DecoderLayer
 
@@ -136,7 +151,9 @@ def bench_single_layer(layer_type, B, S, T, impl, cfg, warmup=10, iters=50):
     device = torch.device("cuda")
 
     try:
-        DecoderLayer = _import_decoder_layer(impl)
+        # force_eager=True because random weights + kernel paths produce
+        # invalid expert/token indices → CUDA device-side assert
+        DecoderLayer = _import_decoder_layer(impl, force_eager=True)
     except Exception as e:
         return BenchResult(
             name=f"layer_{layer_type}", impl=impl,
