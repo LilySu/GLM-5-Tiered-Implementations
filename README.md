@@ -5,10 +5,13 @@ Two implementations of the GLM-5 model (arXiv 2602.15763v2), a 744B parameter
 
 ```
 glm5/
-  glm5-raw-decoupled-from-hf/   Pure PyTorch reference (no HF dependency)
-  glm5-triton/                   Self-contained model + Triton kernels from unsloth
-  data/                          Shared test data (both implementations use this)
-  viz/                           Architecture visualization
+  glm5-raw-decoupled-from-hf/          Pure PyTorch reference (no HF dependency)
+  glm5-triton/                          Self-contained model + Triton kernels from unsloth
+  glm5-kernels-flashmla-deepgemm/       FlashMLA + DeepGEMM CUDA kernels (H100)
+  glm5-kernels-flashinfer/              FlashInfer FA3 + DeepGEMM kernels (H100)
+  benchmark/                            Academic benchmark suite (SC'25/MLSys/OSDI style)
+  data/                                 Shared test data (both implementations use this)
+  viz/                                  Architecture visualization
 ```
 
 ### Architecture visualization
@@ -173,6 +176,19 @@ GLM-5 combines three innovations:
 | **Tokenizer** | Yes (`tokenizer.py`) | No |
 | **Dependencies** | torch, safetensors, tokenizers | torch, triton |
 | **Self-contained** | Yes (but needs checkpoint) | Yes (runs with random weights) |
+
+## H100 Kernel Implementations
+
+Two additional implementations use vendor CUDA kernels for H100 (SM90):
+
+- **glm5-kernels-flashmla-deepgemm/** — FlashMLA for attention + DeepGEMM for MoE/DSA scoring
+- **glm5-kernels-flashinfer/** — FlashInfer FA3 for attention + DeepGEMM for MoE/DSA scoring
+
+See [benchmark/README.md](benchmark/README.md) for benchmark methodology and results.
+
+## Docker Setup (RunPod / Cloud GPU)
+
+For running on RunPod or any cloud GPU, see **[README-Docker-Setup.md](README-Docker-Setup.md)** — includes a pre-built Docker image with FlashMLA, DeepGEMM, FlashInfer, and PyTorch 2.8 so packages survive pod restarts.
 
 ## References
 
