@@ -186,9 +186,19 @@ Two additional implementations use vendor CUDA kernels for H100 (SM90):
 
 See [benchmark/README.md](benchmark/README.md) for benchmark methodology and results.
 
+## RunPod Quick Start
+
+After every pod restart, kernel packages (FlashMLA, DeepGEMM) are lost because RunPod only persists `/workspace`. Run this once after each restart:
+
+```bash
+source /workspace/GLM-5-Decoupled-From-HuggingFace/setup.sh
+```
+
+This reinstalls FlashMLA and DeepGEMM from the source already in `/workspace` (~60 seconds), sets up FlashInfer on the Python path, and verifies all three imports.
+
 ## Docker Setup (RunPod / Cloud GPU)
 
-For running on RunPod or any cloud GPU, see **[README-Docker-Setup.md](README-Docker-Setup.md)** — includes a pre-built Docker image with FlashMLA, DeepGEMM, FlashInfer, and PyTorch 2.8 so packages survive pod restarts.
+To skip the manual setup entirely, build a Docker image with everything pre-installed. See **[README-Docker-Setup.md](README-Docker-Setup.md)** for step-by-step instructions to build, push to Docker Hub, and use as a RunPod custom image.
 
 ## References
 
