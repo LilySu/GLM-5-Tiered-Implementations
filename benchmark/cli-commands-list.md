@@ -60,6 +60,23 @@ All three serving profile experiments (~30 min):
 cd /workspace/GLM-5-Decoupled-From-HuggingFace && python3 -m benchmark.bench_serving_profile --experiment all --output-dir results/serving_profile/
 ```
 
+## DSA indexer context scaling (NEW)
+
+DSA indexer latency scaling at GLM-5 Table 6 context lengths (~10 min):
+```
+cd /workspace/GLM-5-Decoupled-From-HuggingFace && python3 -m benchmark.bench_dsa_context_scaling --experiment all --output-dir results/dsa_scaling/
+```
+
+Indexer-only scaling curve (~5 min):
+```
+cd /workspace/GLM-5-Decoupled-From-HuggingFace && python3 -m benchmark.bench_dsa_context_scaling --experiment indexer-scaling --output-dir results/dsa_scaling/
+```
+
+Indexer as fraction of total decode latency (~5 min):
+```
+cd /workspace/GLM-5-Decoupled-From-HuggingFace && python3 -m benchmark.bench_dsa_context_scaling --experiment indexer-fraction --output-dir results/dsa_scaling/
+```
+
 ## Already completed
 
 - `h100_bench --full-dims` — FlashMLA 228 TFLOPS, DeepGEMM MoE 606 TFLOPS, dense layer 2.7ms, sparse layer 4.8ms
