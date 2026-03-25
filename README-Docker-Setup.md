@@ -186,6 +186,15 @@ You're using a stock RunPod template, not the custom Docker image. Either rebuil
 **FlashMLA build fails with "unsupported SM"**
 You're not on SM90. FlashMLA dense decode requires H100/H200. Check `torch.cuda.get_device_capability()`.
 
+**DeepGEMM `fp8_mqa_logits` fails with "cannot open source file cutlass/arch/barrier.h"**
+DeepGEMM was installed as an editable install (`pip install -e .`) which doesn't bundle CUTLASS headers. Also `/workspace/DeepGEMM` on `PYTHONPATH` shadows the site-packages version. Fix: run `source setup.sh` which does a non-editable install and cleans `PYTHONPATH`.
+
+**DeepGEMM `fp8_mqa_logits` fails with "expression must have a constant value" (`cute::numeric_limits`)**
+CUDA 12.8's NVRTC doesn't support `cute::numeric_limits<float>::infinity()` as constexpr. The `setup.sh` script patches this automatically by replacing it with `-1e38f` (a plain float literal that is always constexpr and functionally equivalent to -infinity for softmax masking). If you need to patch manually:
+```bash
+sed -i 's/constexpr float neg_inf = .*/constexpr float neg_inf = -1e38f;/' /usr/local/lib/python3.12/dist-packages/deep_gemm/include/deep_gemm/impls/smxx_clean_logits.cuh
+```
+
 **DeepGEMM JIT compilation hangs**
 Set `DG_JIT_USE_NVRTC=1` (already set in the Dockerfile). If still slow, check that CUDA toolkit matches PyTorch's CUDA version.
 

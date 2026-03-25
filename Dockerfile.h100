@@ -31,6 +31,11 @@ ENV DG_JIT_USE_NVRTC=1
 ENV DG_JIT_CACHE_DIR=/workspace/.deep_gemm_cache
 RUN mkdir -p /workspace/.deep_gemm_cache
 
+# Patch CUDA 12.8 NVRTC incompatibility: cute::numeric_limits<float>::infinity() not constexpr
+# Replace with -1e38f literal (functionally -inf for softmax masking, always constexpr)
+RUN sed -i 's/constexpr float neg_inf = .*/constexpr float neg_inf = -1e38f;/' \
+    /usr/local/lib/python3.12/dist-packages/deep_gemm/include/deep_gemm/impls/smxx_clean_logits.cuh
+
 # Python deps for benchmarks
 RUN pip install scipy pandas numpy safetensors
 
