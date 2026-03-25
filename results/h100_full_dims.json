@@ -1,0 +1,78 @@
+{
+  "gpu": "NVIDIA H100 80GB HBM3",
+  "sm_version": "9.0",
+  "gpu_memory_gb": 85.017493504,
+  "world_size": 1,
+  "config": "full",
+  "results": [
+    {
+      "name": "flashmla_decode",
+      "median_ms": 0.08006399869918823,
+      "min_ms": 0.07894399762153625,
+      "max_ms": 0.08403199911117554,
+      "tflops": 227.98775110622938,
+      "bandwidth_gb_s": null,
+      "batch": 32,
+      "seq_kv": 4096,
+      "heads": 64
+    },
+    {
+      "name": "deepgemm_mqa_logits",
+      "median_ms": 0.08828800171613693,
+      "min_ms": 0.0854400023818016,
+      "max_ms": 0.12515200674533844,
+      "tflops": 0.3800565348379275,
+      "bandwidth_gb_s": null,
+      "seq": 1,
+      "seq_kv": 4096,
+      "heads": 32,
+      "dim": 128
+    },
+    {
+      "name": "deepgemm_grouped_gemm",
+      "median_ms": 0.34003201127052307,
+      "min_ms": 0.33423998951911926,
+      "max_ms": 0.34854400157928467,
+      "tflops": 606.2912413384051,
+      "bandwidth_gb_s": null,
+      "tokens": 1024,
+      "experts": 256,
+      "topk": 8,
+      "D": 6144,
+      "I": 2048,
+      "precision": "bf16"
+    },
+    {
+      "name": "moe_router_sigmoid",
+      "median_ms": 0.09484799951314926,
+      "min_ms": 0.09331200271844864,
+      "max_ms": 0.10454399883747101,
+      "tflops": null,
+      "bandwidth_gb_s": null,
+      "tokens": 4096,
+      "experts": 256
+    },
+    {
+      "name": "single_layer_dense",
+      "median_ms": 2.715456008911133,
+      "min_ms": 2.707808017730713,
+      "max_ms": 2.7300479412078857,
+      "tflops": null,
+      "bandwidth_gb_s": null,
+      "batch": 1,
+      "seq": 128,
+      "type": "dense"
+    },
+    {
+      "name": "single_layer_sparse",
+      "median_ms": 4.831039905548096,
+      "min_ms": 4.808256149291992,
+      "max_ms": 5.391903877258301,
+      "tflops": null,
+      "bandwidth_gb_s": null,
+      "batch": 1,
+      "seq": 128,
+      "type": "sparse"
+    }
+  ]
+}
