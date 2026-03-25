@@ -112,7 +112,8 @@ def _indexer_score_deepgemm(q, k_cached, weights):
     seq_len_kv = k_2d.shape[0]
 
     q_fp8 = q_3d.to(torch.float8_e4m3fn)
-    kv_tuple = per_token_cast_to_fp8(k_2d, use_ue8m0=True)
+    kv_tuple = per_token_cast_to_fp8(k_2d, use_ue8m0=False)
+    kv_tuple = (kv_tuple[0], kv_tuple[1].squeeze(-1))  # scales must be 1D [T] for fp8_mqa_logits
 
     cu_k_start = torch.zeros(seq_len, dtype=torch.int32, device=q.device)
     cu_k_end = torch.full((seq_len,), seq_len_kv, dtype=torch.int32, device=q.device)

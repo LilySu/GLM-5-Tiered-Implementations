@@ -150,6 +150,7 @@ class DSAIndexer(nn.Module):
         # KV: tuple of (FP8 tensor [T, D], 1D scales [T])
         # Use per_token_cast_to_fp8 with ue8m0=True (confirmed by fix_kernels_h100.py)
         kv_tuple = per_token_cast_to_fp8(k_2d, use_ue8m0=True)
+        kv_tuple = (kv_tuple[0], kv_tuple[1].squeeze(-1))  # scales must be 1D [T]
 
         # ── Causal sequence ranges ────────────────────────────────────
         cu_k_start = torch.zeros(seq_len, dtype=torch.int32, device=q.device)
